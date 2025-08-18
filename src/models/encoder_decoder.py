@@ -16,12 +16,39 @@ from transformers.modeling_outputs import Seq2SeqLMOutput
 from transformers.models.t5.modeling_t5 import T5Stack
 from transformers.tokenization_utils_base import BatchEncoding
 
+##### define reconction model
+class ReconstructionModel(nn.Module):
+    def __init__(self, hidden_size: int, vocab_size: int, max_seq_length: int):
+        super().__init__()
+        # Project embedding to sequence of hidden states
+        self.proj = nn.Linear(hidden_size, hidden_size * max_seq_length)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.out = nn.Linear(hidden_size, vocab_size)
+        self.max_seq_length = max_seq_length
 
+    def forward(self, z):
+        # z: [batch_size, hidden_size]
+        batch_size = z.size(0)
+        # Project to [batch_size, max_seq_length * hidden_size]
+        seq = self.proj(z)
+        # Reshape to [batch_size, max_seq_length, hidden_size]
+        seq = seq.view(batch_size, self.max_seq_length, -1)
+        # Normalize
+        seq = self.norm(seq)
+        # Project to logits: [batch_size, max_seq_length, vocab_size]
+        logits = self.out(seq)
+        return logits
+
+    def model(self):
+        return self
+
+#### define encoder-decoder module
 class EncoderDecoderModule(LightningModule):
     def __init__(
         self,
         encoder_model: T5EncoderModel,
         decoder_model: Callable[..., T5Stack],
+        rec_model : Any = None,
         input_tokenizer: Any,
         output_tokenizer: Any,
         optimizer: torch.optim.Optimizer,
@@ -31,11 +58,12 @@ class EncoderDecoderModule(LightningModule):
         metadata_embedder_output_dim: Optional[int] = None,
         non_shuffled_datamodule=None,
         temperature: float = 0.07,
+        max_seq_length: int = 512,
     ) -> None:
         super().__init__()
 
         self.save_hyperparameters(logger=False)
-        
+        ##### define encoder
         self.encoder_hidden_size = encoder_model.config.hidden_size
         self.decoder_hidden_size = self.encoder_hidden_size
         self.non_shuffled_datamodule = non_shuffled_datamodule
@@ -53,7 +81,13 @@ class EncoderDecoderModule(LightningModule):
 
         self.decoder = decoder_model()
         self.temperature = temperature
+        #### define reconstruction layer
+        self.rec_model = rec_model.model() if rec_model else ReconstructionModel(hidden_size=self.encoder_hidden_size,
+                vocab_size=input_tokenizer.vocab_size,
+                max_seq_length=max_seq_length)
 
+
+        ###################################
         self.projection_head = nn.Sequential(
             nn.Linear(self.encoder_hidden_size, self.encoder_hidden_size),
             nn.ReLU(),
@@ -65,7 +99,7 @@ class EncoderDecoderModule(LightningModule):
             nn.ReLU(),
             nn.Linear(metadata_embedder_output_dim, 128),
         )
-
+        #### define decoder input projection 
         self.decoder_input_proj = nn.Linear(
             self.encoder_hidden_size, self.decoder_hidden_size
         )
@@ -81,11 +115,23 @@ class EncoderDecoderModule(LightningModule):
         self.train_loss = MeanMetric()
         self.train_con_loss = MeanMetric()
         self.train_lip_loss = MeanMetric()
+        self.train_rec_loss = MeanMetric()
 
         self.val_total_loss = MeanMetric()
         self.val_loss = MeanMetric()
         self.val_con_loss = MeanMetric()
         self.val_lip_loss = MeanMetric()
+        self.val_rec_loss = MeanMetric()
+
+    ### define reconstruction loss 
+    def rec_loss(self, x: torch.Tensor, recon_outputs: torch.Tensor) -> torch.Tensor:
+        loss = torch.nn.functional.cross_entropy(
+               recon_outputs.view(-1, recon_outputs.size(-1)),  # [batch_size * max_seq_length, vocab_size]
+               x.to(self.device).view(-1),                     # [batch_size * max_seq_length]
+               ignore_index=0,                                 # Ignore padding token
+               reduction="mean"
+               ) / self.temperature
+        return loss
 
     def contrastive_loss(self, embeddings1, embeddings2):
         embeddings1 = F.normalize(embeddings1, dim=1)
@@ -130,7 +176,7 @@ class EncoderDecoderModule(LightningModule):
             return torch.tensor(0.0, device=self.device)
             
         return ratio.mean()
-
+    #### define forward
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -149,6 +195,11 @@ class EncoderDecoderModule(LightningModule):
 
         mean_pooled = self._mean_pooling(encoder_hidden_states, attention_mask)
         projected_embeddings = self.projection_head(mean_pooled)
+        # Reconstruction 
+        recon_outputs = self.rec_model(mean_pooled)
+        rec_loss = self.rec_loss(input_ids, recon_outputs) if input_ids is not None else None
+
+
 
         # Decoder
         if decoder_input_ids is not None:
@@ -173,15 +224,17 @@ class EncoderDecoderModule(LightningModule):
             loss=loss,
             logits=lm_logits,
             encoder_hidden_states=encoder_hidden_states,
-            projected_embeddings=projected_embeddings
+            projected_embeddings=projected_embeddings,
+            rec_loss= rec_loss
         )
-
+    ### hook function begin each batch
     def on_train_start(self) -> None:
         self.val_loss.reset()
         self.val_total_loss.reset()
         self.val_con_loss.reset()
         self.val_lip_loss.reset()
-
+        self.val_rec_loss.reset()
+    #### return loss 
     def model_step(
         self, batch: Dict[str, torch.Tensor]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -194,7 +247,7 @@ class EncoderDecoderModule(LightningModule):
         )
         loss = outputs.loss
         return loss, outputs, batch["labels"]
-
+    #### training 
     def training_step(
         self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
@@ -213,9 +266,11 @@ class EncoderDecoderModule(LightningModule):
             decoder_attention_mask=batch["decoder_attention_mask"],
             labels=batch["labels"],
         )
-
+        #### prediction loss
         main_loss = outputs.loss
-
+        #### rec loss
+        rec_loss = outputs.rec_loss
+        ##### compute contrastive loss with metadata 
         with torch.no_grad():
             m_embeddings = self._emb_metadata(batch["metadata"])
         metadata_embeddings = self.metadata_projection_head(m_embeddings)
@@ -229,7 +284,7 @@ class EncoderDecoderModule(LightningModule):
             attention_mask=non_shuffled_batch["attention_mask"].to(self.device),
         ).last_hidden_state
         non_shuffled_emb = self._mean_pooling(non_shuffled_outputs, non_shuffled_batch["attention_mask"].to(self.device))
-        
+        #### create task data: embedding-value
         task_data = {}
         for i in range(len(non_shuffled_batch["task_name"])):
             task = non_shuffled_batch["task_name"][i]
@@ -241,7 +296,7 @@ class EncoderDecoderModule(LightningModule):
                 task_data[task]["value"].append(non_shuffled_batch["value"][i : i + 1])
             else:
                 task_data[task]["value"].append(non_shuffled_batch["value"][i])
-
+        #### compute lipschitz_loss 
         lipschitz_loss = 0
         for task in task_data:
             if len(task_data[task]["text"]) > 0:
@@ -258,19 +313,23 @@ class EncoderDecoderModule(LightningModule):
             lipschitz_loss += self.lipschitz_loss(
                 z=task_data[task]["text"].to(self.device), y=task_data[task]["value"].to(self.device)
             ) * (len(task_data[task]["value"]) / len(non_shuffled_batch["value"]))
-
-        total_loss = main_loss + contrastive_loss / (contrastive_loss / main_loss).detach() + lipschitz_loss / (lipschitz_loss / main_loss).detach()
+        
+        #### Add rec loss to total loss
+        total_loss = main_loss + rec_loss + contrastive_loss / (contrastive_loss / main_loss).detach() + lipschitz_loss / (lipschitz_loss / main_loss).detach()
         # total_loss = main_loss + contrastive_loss + lipschitz_loss
-
+       
         self.train_total_loss(total_loss)
         self.train_loss(main_loss)
         self.train_con_loss(contrastive_loss)
         self.train_lip_loss(lipschitz_loss)
+        self.train_rec_loss(rec_loss)
 
         self.log("train/main_loss", self.train_loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train/total_loss", self.train_total_loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train/contrastive_loss", self.train_con_loss, on_step=True, on_epoch=True)
         self.log("train/lipschitz_loss", self.train_lip_loss, on_step=True, on_epoch=True)
+        self.log("train/rec_loss", self.train_rec_loss, on_step = True, on_epoch = True)
+
 
         return total_loss
 
@@ -307,8 +366,9 @@ class EncoderDecoderModule(LightningModule):
             decoder_attention_mask=batch["decoder_attention_mask"],
             labels=batch["labels"],
         )
-
+        ### get main loss and rec loss
         main_loss = outputs.loss
+        rec_loss = outputs.rec_loss
 
         with torch.no_grad():
             m_embeddings = self._emb_metadata(batch["metadata"])
@@ -354,18 +414,21 @@ class EncoderDecoderModule(LightningModule):
             ) * (len(task_data[task]["value"]) / len(non_shuffled_batch["value"]))
 
         # total_loss = main_loss + contrastive_loss / (contrastive_loss / main_loss).detach() + lipschitz_loss / (lipschitz_loss / main_loss).detach()
-        total_loss = main_loss + contrastive_loss + lipschitz_loss
+        # Add rec_loss to total loss
+        total_loss = main_loss + rec_loss + contrastive_loss + lipschitz_loss
 
         self.val_total_loss(total_loss)
         self.val_loss(main_loss)
         self.val_con_loss(contrastive_loss)
         self.val_lip_loss(lipschitz_loss)
+        self.val_rec_loss(rec_loss)
 
         self.log("val/main_loss", self.val_loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("val/total_loss", self.val_total_loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("val/contrastive_loss", self.val_con_loss, on_step=True, on_epoch=True)
         self.log("val/lipschitz_loss", self.val_lip_loss, on_step=True, on_epoch=True)
-
+        self.log("val/rec_loss", self.val_rec_loss, on_step = True, on_epoch = True)
+        
         return total_loss
 
     def on_validation_epoch_end(self) -> None:
